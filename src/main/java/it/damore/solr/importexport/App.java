@@ -13,6 +13,7 @@ import java.net.URL;
 import java.net.URLConnection;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +23,7 @@ import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+import it.damore.solr.importexport.acls.AclDocumentGenerator;
 import org.apache.commons.cli.ParseException;
 import org.apache.http.auth.AuthScope;
 import org.apache.http.auth.UsernamePasswordCredentials;
@@ -32,7 +34,8 @@ import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrQuery.ORDER;
 import org.apache.solr.client.solrj.SolrServerException;
-import org.apache.solr.client.solrj.impl.HttpSolrClient;
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
+import org.apache.solr.client.solrj.impl.CloudSolrClient;
 import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
 import org.apache.solr.common.SolrDocument;
@@ -72,6 +75,7 @@ import it.damore.solr.importexport.config.SolrField.MatchType;
  */
 public class App {
 
+    public static final String COLLECTION = System.getProperty("collection");
     private static Logger logger = LoggerFactory.getLogger(App.class);
     private static CommandLineConfig config = null;
     private static ObjectMapper objectMapper = new ObjectMapper();
@@ -134,11 +138,9 @@ public class App {
                                                  .setDefaultCredentialsProvider(provider);
         }
 
-        HttpClient httpClient = httpClientBuilder.build();
-
-        try (HttpSolrClient client = new HttpSolrClient.Builder().withBaseSolrUrl(config.getSolrUrl())
-                                                                 .withHttpClient(httpClient)
-                                                                 .build()) {
+        try (CloudSolrClient client = new CloudSolrClient.Builder().withZkHost(System.getProperty("zkHost"))
+            .withZkChroot(System.getProperty("zkChroot")).build()) {
+            AclDocumentGenerator aclDocumentGenerator = new AclDocumentGenerator(client, COLLECTION);
 
             try {
                 switch (config.getActionType()) {
@@ -151,7 +153,7 @@ public class App {
                     case RESTORE:
                     case IMPORT:
 
-                        writeAllDocuments(client, new File(config.getFileName()));
+                        writeAllDocuments(aclDocumentGenerator, client, new File(config.getFileName()));
                         break;
 
                     default:
@@ -243,8 +245,7 @@ public class App {
      * @throws IOException
      * @throws SolrServerException
      */
-    private static void writeAllDocuments(HttpSolrClient client, File outputFile) throws FileNotFoundException, IOException, SolrServerException {
-        AtomicInteger counter = new AtomicInteger(10000);
+    private static void writeAllDocuments(AclDocumentGenerator aclDocumentGenerator, CloudSolrClient client, File outputFile) throws FileNotFoundException, IOException, SolrServerException {
         if (!config.getDryRun() && config.getDeleteAll()) {
             logger.info("delete all!");
             client.deleteByQuery("*:*");
@@ -277,9 +278,9 @@ public class App {
                                                          return d;
                                                      })
                                                      .collect(Collectors.toList());
-                  if (!insertBatch(client, collect)) {
+                  if (!insertBatch(aclDocumentGenerator, client, collect)) {
                       int retry = 5;
-                      while (--retry > 0 && !insertBatch(client, collect))// randomly when imported 10M documents, solr failed
+                      while (--retry > 0 && !insertBatch(aclDocumentGenerator, client, collect))// randomly when imported 10M documents, solr failed
                           // on Timeout exactly 10 minutes..
                           ;
                   }
@@ -290,13 +291,17 @@ public class App {
 
     }
 
-    private static boolean insertBatch(HttpSolrClient client, List<SolrInputDocument> collect) {
+    private static boolean insertBatch(AclDocumentGenerator aclDocumentGenerator, CloudSolrClient client, List<SolrInputDocument> collect) {
         try {
 
             if (!config.getDryRun()) {
-                logger.info("adding " + collect.size() + " documents (" + incrementCounter(collect.size()) + ")");
+                List<SolrInputDocument> aclBatch = new ArrayList<>();
+                for (SolrInputDocument solrInputDocument : collect) {
+                    aclBatch.addAll(aclDocumentGenerator.createAclDocuments(solrInputDocument, "_lw_acl_ss"));
+                }
+                logger.info("adding " + aclBatch.size() + " acl documents (" + incrementCounter(aclBatch.size()) + ") from " + collect.size() + " docs");
                 if (counter >= skipCount) {
-                    client.add(collect);
+                    client.add(COLLECTION, aclBatch);
                     if (commitAfter != null && counter - lastCommit > commitAfter) {
                         commit(client);
                         lastCommit = counter;
@@ -312,9 +317,9 @@ public class App {
         return true;
     }
 
-    private static void commit(HttpSolrClient client) throws SolrServerException, IOException {
+    private static void commit(CloudSolrClient client) throws SolrServerException, IOException {
         if (!config.getDryRun()) {
-            client.commit();
+            client.commit(COLLECTION);
             logger.info("Committed");
         }
     }
@@ -325,7 +330,7 @@ public class App {
      * @throws SolrServerException
      * @throws IOException
      */
-    private static void readAllDocuments(HttpSolrClient client, File outputFile) throws SolrServerException, IOException {
+    private static void readAllDocuments(CloudSolrClient client, File outputFile) throws SolrServerException, IOException {
 
         SolrQuery solrQuery = new SolrQuery();
         solrQuery.setTimeAllowed(-1);
@@ -377,7 +382,7 @@ public class App {
                     } else {
                         solrQuery.setStart(page * config.getBlockSize());
                     }
-                    rsp = client.query(solrQuery);
+                    rsp = client.query(COLLECTION, solrQuery);
                     String nextCursorMark = rsp.getNextCursorMark();
                     if (nextCursorMark == null && !disableCursors) {
                         disableCursors = true;
